@@ -2,5 +2,5 @@ fastapi
 uvicorn
 edge-tts
 langdetect
-pyaudioop
+audioop-lts
 pydub
