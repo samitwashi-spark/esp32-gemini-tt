@@ -1,11 +1,11 @@
 import sys
 
-# Critical fix for Python 3.13+ environment on Render
+# Drop-in compatibility patch for Python 3.13+ on Render
 try:
     import audioop
 except ImportError:
-    import pyaudioop
-    sys.modules['audioop'] = pyaudioop
+    import audioop_lts
+    sys.modules['audioop'] = audioop_lts
 
 import os
 import asyncio
