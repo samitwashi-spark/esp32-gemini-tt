@@ -1,4 +1,5 @@
 fastapi
 uvicorn
-google-genai
 edge-tts
+pydub
+langdetect
