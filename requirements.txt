@@ -4,3 +4,4 @@ edge-tts
 langdetect
 audioop-lts
 pydub
+google-genai
