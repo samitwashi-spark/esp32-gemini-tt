@@ -26,7 +26,7 @@ app = FastAPI()
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"   # check AI Studio for the latest model name
+GEMINI_MODEL = "gemini-3.5-flash"   # check AI Studio for the latest model name
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 SYSTEM_PROMPT = (
