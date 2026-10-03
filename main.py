@@ -1,6 +1,5 @@
 import sys
 
-# Drop-in compatibility patch for Python 3.13+ on Render
 try:
     import audioop
 except ImportError:
@@ -10,7 +9,7 @@ except ImportError:
 import io
 import asyncio
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 import edge_tts
 from pydub import AudioSegment
 from langdetect import detect
@@ -18,28 +17,22 @@ from langdetect import detect
 app = FastAPI()
 
 def get_voice_by_langdetect(text: str) -> str:
-    """Detects language grammar using langdetect and assigns the neural voice"""
     try:
         lang = detect(text)
-        print(f"langdetect identified language code: {lang}")
-        
+        print(f"Language identified: {lang}")
         if lang == 'bn':
-            print("Voice selected: Bangla -> Nabanita")
             return "bn-BD-NabanitaNeural"
         elif lang == 'hi':
-            print("Voice selected: Hindi -> Swara")
             return "hi-IN-SwaraNeural"
         elif lang == 'ar':
-            print("Voice selected: Arabic -> Fatima")
             return "ar-AE-FatimaNeural"
-            
     except Exception as e:
-        print(f"Language detection fallback to English: {e}")
+        print(f"Fallback to English: {e}")
         
     return "en-US-EmmaNeural"
 
-async def generate_true_wav_bytes(text: str, voice_model: str) -> bytes:
-    """Generates speech in memory and converts it into pure 24kHz mono 16-bit PCM WAV"""
+async def generate_pcm_raw(text: str, voice_model: str):
+    """Generates speech and returns uncompressed raw PCM data (16-bit mono 24kHz)"""
     communicate = edge_tts.Communicate(text, voice_model)
     
     mp3_buffer = io.BytesIO()
@@ -49,35 +42,44 @@ async def generate_true_wav_bytes(text: str, voice_model: str) -> bytes:
             
     mp3_buffer.seek(0)
     
-    # Process audio purely in memory using pydub
+    # Process using pydub
     sound = AudioSegment.from_mp3(mp3_buffer)
     sound = sound.set_frame_rate(24000) # 24kHz Sample Rate
-    sound = sound.set_channels(1)       # Mono Audio Output
-    sound = sound.set_sample_width(2)   # 16-bit depth (2 bytes per sample)
+    sound = sound.set_channels(1)       # Mono
+    sound = sound.set_sample_width(2)   # 16-bit PCM (2 bytes/sample)
     
-    wav_buffer = io.BytesIO()
-    sound.export(wav_buffer, format="wav")
-    return wav_buffer.getvalue()
+    # Export raw PCM data (no WAV headers to break streaming)
+    pcm_buffer = io.BytesIO()
+    sound.export(pcm_buffer, format="raw")
+    return pcm_buffer.getvalue()
 
 @app.get("/ping")
 def ping():
     return {"status": "alive"}
 
 @app.get("/tts")
-async def text_to_speech_wav(text: str):
+async def text_to_speech_stream(text: str):
     if not text:
         raise HTTPException(status_code=400, detail="Text parameter cannot be empty")
         
     try:
         selected_voice = get_voice_by_langdetect(text)
-        wav_bytes = await generate_true_wav_bytes(text, selected_voice)
+        pcm_data = await generate_pcm_raw(text, selected_voice)
 
-        return Response(
-            content=wav_bytes,
-            media_type="audio/wav",
+        def iter_pcm():
+            # Stream in 1024-byte chunks
+            chunk_size = 1024
+            for i in range(0, len(pcm_data), chunk_size):
+                yield pcm_data[i:i + chunk_size]
+
+        return StreamingResponse(
+            iter_pcm(),
+            media_type="audio/pcm",
             headers={
-                "Content-Disposition": "attachment; filename=response.wav",
-                "Content-Length": str(len(wav_bytes))
+                "X-Sample-Rate": "24000",
+                "X-Channels": "1",
+                "X-Bits-Per-Sample": "16",
+                "Content-Length": str(len(pcm_data))
             }
         )
 
