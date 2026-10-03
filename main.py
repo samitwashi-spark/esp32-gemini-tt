@@ -26,18 +26,40 @@ app = FastAPI()
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-GEMINI_MODEL = "gemini-3.5-flash"   # check AI Studio for the latest model name
+GEMINI_MODEL = "gemini-3.5-flash"
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 SYSTEM_PROMPT = (
-    "You are a voice assistant speaking through a small speaker. "
+    "You are a voice assistant. "
     "Answer in 2 to 4 short sentences. "
     "Reply in the same language the user asked in. "
     "Use plain text only: no markdown, no bullet points, no emojis, no asterisks. "
-    "If web search results are provided, treat them as more up to date than your own "
+    "You have a web_search tool. Use it for news, current events, anything recent or "
+    "'latest', prices, scores, weather, and general-knowledge or factual lookups "
+    "(who, what, when, where questions about real people, places, organizations or events). "
+    "Do NOT use it for greetings, small talk, jokes, opinions, advice, math, translation, "
+    "writing, or explaining how things work. Just answer those directly. "
+    "When web search results are provided, treat them as more up to date than your own "
     "knowledge and base your answer on them. If the results do not contain the answer, "
     "say you could not find it instead of guessing."
 )
+
+SEARCH_TOOL = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="web_search",
+        description="Search the web for current news, recent events, or factual information.",
+        parameters=types.Schema(
+            type="OBJECT",
+            properties={
+                "query": types.Schema(
+                    type="STRING",
+                    description="A short, specific web search query.",
+                )
+            },
+            required=["query"],
+        ),
+    )
+])
 
 def get_voice_by_langdetect(text: str) -> str:
     """Detects language using langdetect and assigns the neural voice"""
@@ -110,6 +132,8 @@ async def tavily_search(query: str) -> str:
                     "search_depth": "basic",
                     "max_results": 3,
                     "include_answer": True,
+                    "include_images": True,
+                    "include_image_descriptions": True,
                 },
             )
             r.raise_for_status()
@@ -125,31 +149,56 @@ async def tavily_search(query: str) -> str:
         title = item.get("title", "")
         content = (item.get("content") or "")[:500]
         parts.append(f"- {title}: {content}")
+    for img in data.get("images", [])[:3]:
+        if isinstance(img, dict) and img.get("description"):
+            parts.append(f"- Image: {img['description']}")
     return "\n".join(parts)
 
 async def ask_gemini(question: str) -> str:
     if gemini_client is None:
         raise RuntimeError("GEMINI_API_KEY is not set on the server")
 
-    search_context = await tavily_search(question)
     today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+
+    # Step 1: Gemini decides. It either answers directly or asks for a web search.
+    first = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=f"Today's date: {today}\n\nQuestion: {question}",
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=1024,
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+            tools=[SEARCH_TOOL],
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        ),
+    )
+
+    calls = first.function_calls
+    if not calls:
+        print("No web search needed, answering directly")
+        return first.text or "Sorry, I could not think of an answer."
+
+    # Step 2: Gemini asked for a search, so run Tavily and answer from the results.
+    query = (calls[0].args or {}).get("query") or question
+    print(f"Searching Tavily for: {query}")
+    search_context = await tavily_search(query)
+    print(f"Search context:\n{search_context or '(none)'}")
 
     prompt = f"Today's date: {today}\n\n"
     if search_context:
         prompt += f"Web search results:\n{search_context}\n\n"
     prompt += f"Question: {question}"
 
-    print(f"Search context:\n{search_context or '(none)'}")
-
-    response = await gemini_client.aio.models.generate_content(
+    second = await gemini_client.aio.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=400,
+            max_output_tokens=1024,
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
         ),
     )
-    return response.text or "Sorry, I could not think of an answer."
+    return second.text or "Sorry, I could not think of an answer."
 
 @app.get("/ping")
 def ping():
@@ -170,7 +219,7 @@ async def text_to_speech_wav(text: str):
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Searches the web, asks Gemini, then speaks the answer
+# Gemini decides whether to search, then the answer is spoken
 @app.get("/ask")
 async def ask_and_speak(q: str):
     if not q:
