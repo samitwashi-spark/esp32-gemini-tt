@@ -10,6 +10,7 @@ except ImportError:
 import io
 import os
 import re
+import json
 import asyncio
 from datetime import datetime, timezone
 
@@ -19,27 +20,32 @@ from fastapi.responses import Response
 import edge_tts
 from pydub import AudioSegment
 from langdetect import detect
-from google import genai
-from google.genai import types
 
 app = FastAPI()
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# Tried in order. If one hits its quota or is overloaded, the next is used.
-GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite"]
-
-# Speech-to-text. whisper-large-v3 is a bit more accurate (good for Bangla).
-# whisper-large-v3-turbo is faster and cheaper. Change it here or in Render's Environment tab.
-GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3")
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
+# Chat models, tried in order. If the first is rate limited or failing, the next is used.
+# You can reorder them or override from Render's Environment tab, e.g.
+# LLM_MODELS=openai/gpt-oss-20b,openai/gpt-oss-120b
+LLM_MODELS = [
+    m.strip() for m in os.environ.get(
+        "LLM_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b"
+    ).split(",") if m.strip()
+]
+
+# "low" is fastest. You can use "medium" or "high" for harder questions.
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "low")
+
+# Speech-to-text model
+GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3")
 
 # Recordings smaller than this are treated as "too short" (about half a second)
 MIN_AUDIO_BYTES = 16000
-
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 SYSTEM_PROMPT = (
     "You are a voice assistant speaking through a small speaker. "
@@ -57,22 +63,23 @@ SYSTEM_PROMPT = (
     "say you could not find it instead of guessing."
 )
 
-SEARCH_TOOL = types.Tool(function_declarations=[
-    types.FunctionDeclaration(
-        name="web_search",
-        description="Search the web for current news, recent events, or factual information.",
-        parameters=types.Schema(
-            type="OBJECT",
-            properties={
-                "query": types.Schema(
-                    type="STRING",
-                    description="A short, specific web search query.",
-                )
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web for current news, recent events, or factual information.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "A short, specific web search query.",
+                }
             },
-            required=["query"],
-        ),
-    )
-])
+            "required": ["query"],
+        },
+    },
+}
 
 BUSY_MESSAGE = "Sorry, I am busy right now. Please try again in a moment."
 TOO_SHORT_MESSAGE = "The recording was too short. Please hold the button and try again."
@@ -144,7 +151,7 @@ async def speak_message(text: str) -> Response:
 
 async def tavily_search(query: str) -> str:
     """Search the web with Tavily and return a compact text summary.
-    Returns an empty string if search is unavailable, so Gemini still answers."""
+    Returns an empty string if search is unavailable, so the model still answers."""
     if not TAVILY_API_KEY:
         print("TAVILY_API_KEY not set, skipping web search")
         return ""
@@ -205,51 +212,82 @@ async def transcribe_with_groq(wav_bytes: bytes, language: str = "") -> str:
         r.raise_for_status()
         return (r.json().get("text") or "").strip()
 
-async def generate_with_fallback(contents, config):
-    """Try each model in order. Retry once on 503 (overloaded).
-    On quota errors (429) or any other error, move to the next model."""
+async def groq_chat(messages: list, tools: list = None) -> dict:
+    """Call Groq chat completions. Tries each model in LLM_MODELS in order.
+    Retries once on server errors, and moves to the next model on rate limits or other errors.
+    Returns the assistant message dict."""
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set on the server")
+
     last_error = None
-    for model in GEMINI_MODELS:
+    for model in LLM_MODELS:
         for attempt in range(2):
+            payload = {
+                "model": model,
+                "messages": messages,
+                "reasoning_effort": REASONING_EFFORT,
+                "max_completion_tokens": 1500,
+            }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+
             try:
-                return await gemini_client.aio.models.generate_content(
-                    model=model, contents=contents, config=config
-                )
-            except Exception as e:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    r = await client.post(
+                        GROQ_CHAT_URL,
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                        json=payload,
+                    )
+            except httpx.HTTPError as e:
                 last_error = e
-                msg = str(e)
-                print(f"[{model}] attempt {attempt + 1} failed: {msg[:200]}")
-                if "503" in msg or "UNAVAILABLE" in msg:
-                    await asyncio.sleep(1)
-                    continue          # retry the same model once
-                break                 # quota or other error: go to next model
+                print(f"[{model}] attempt {attempt + 1} network error: {e}")
+                await asyncio.sleep(1)
+                continue
+
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]
+
+            last_error = RuntimeError(f"Groq {r.status_code}: {r.text[:300]}")
+            print(f"[{model}] attempt {attempt + 1} failed: {r.status_code} {r.text[:200]}")
+
+            # The model tried to call the tool but formatted it badly.
+            # Treat it as "a search is needed" so the question is still answered.
+            if r.status_code == 400 and tools and "tool_use_failed" in r.text:
+                return {"_tool_failed": True}
+
+            if r.status_code >= 500:
+                await asyncio.sleep(1)
+                continue          # retry the same model once
+            break                 # rate limit or other error: go to next model
+
     raise last_error
 
-async def ask_gemini(question: str) -> str:
-    if gemini_client is None:
-        raise RuntimeError("GEMINI_API_KEY is not set on the server")
-
+async def ask_llm(question: str) -> str:
     today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
 
-    # Step 1: Gemini decides. It either answers directly or asks for a web search.
-    first = await generate_with_fallback(
-        contents=f"Today's date: {today}\n\nQuestion: {question}",
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=1024,
-            thinking_config=types.ThinkingConfig(thinking_level="low"),
-            tools=[SEARCH_TOOL],
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        ),
-    )
+    # Step 1: the model decides. It either answers directly or asks for a web search.
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Today's date: {today}\n\nQuestion: {question}"},
+    ]
+    first = await groq_chat(messages, tools=[SEARCH_TOOL])
 
-    calls = first.function_calls
-    if not calls:
+    query = None
+    if first.get("_tool_failed"):
+        query = question
+    elif first.get("tool_calls"):
+        try:
+            args = json.loads(first["tool_calls"][0]["function"]["arguments"] or "{}")
+            query = args.get("query") or question
+        except Exception:
+            query = question
+
+    if query is None:
         print("No web search needed, answering directly")
-        return first.text or "Sorry, I could not think of an answer."
+        return (first.get("content") or "").strip() or "Sorry, I could not think of an answer."
 
-    # Step 2: Gemini asked for a search, so run Tavily and answer from the results.
-    query = (calls[0].args or {}).get("query") or question
+    # Step 2: a search was requested, so run Tavily and answer from the results.
     print(f"Searching Tavily for: {query}")
     search_context = await tavily_search(query)
     print(f"Search context:\n{search_context or '(none)'}")
@@ -259,20 +297,16 @@ async def ask_gemini(question: str) -> str:
         prompt += f"Web search results:\n{search_context}\n\n"
     prompt += f"Question: {question}"
 
-    second = await generate_with_fallback(
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=1024,
-            thinking_config=types.ThinkingConfig(thinking_level="low"),
-        ),
-    )
-    return second.text or "Sorry, I could not think of an answer."
+    second = await groq_chat([
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ])
+    return (second.get("content") or "").strip() or "Sorry, I could not think of an answer."
 
 async def answer_to_wav(question: str) -> bytes:
-    """Shared by /ask (typed) and /voice (spoken): question -> Gemini -> speech WAV"""
-    answer = clean_for_speech(await ask_gemini(question))
-    print(f"Question: {question}\nGemini answer: {answer}")
+    """Shared by /ask (typed) and /voice (spoken): question -> model -> speech WAV"""
+    answer = clean_for_speech(await ask_llm(question))
+    print(f"Question: {question}\nAnswer: {answer}")
     voice = get_voice_by_langdetect(answer)
     return await generate_true_wav_bytes(answer, voice)
 
@@ -295,7 +329,7 @@ async def text_to_speech_wav(text: str):
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Typed question (Serial Monitor): Gemini decides whether to search, then speaks
+# Typed question (Serial Monitor): the model decides whether to search, then speaks
 @app.get("/ask")
 async def ask_and_speak(q: str):
     if not q:
