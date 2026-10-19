@@ -1,8 +1,6 @@
-fastapi
-uvicorn
-edge-tts
-langdetect
-audioop-lts
-pydub
-google-genai
-httpx
+   fastapi
+   uvicorn[standard]
+   edge-tts
+   google-genai
+   pydub
+   audioop-lts
