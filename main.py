@@ -10,357 +10,474 @@ except ImportError:
 import io
 import os
 import re
-import json
+import time
+import struct
 import asyncio
-from datetime import datetime, timezone
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi import FastAPI, WebSocket
 import edge_tts
 from pydub import AudioSegment
-from langdetect import detect
+from google import genai
+from google.genai import types
+
+try:
+    import miniaudio          # optional: much faster MP3 decoding
+except Exception:
+    miniaudio = None
 
 app = FastAPI()
 
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+DEVICE_KEY = os.environ.get("DEVICE_KEY", "")      # optional shared secret
 
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-
-# Chat models, tried in order. If the first is rate limited or failing, the next is used.
-# You can reorder them or override from Render's Environment tab, e.g.
-# LLM_MODELS=openai/gpt-oss-20b,openai/gpt-oss-120b
-LLM_MODELS = [
+# Tried in order. Add a fallback in Render, e.g. GEMINI_MODELS=gemini-3.5-flash-lite,gemini-3.5-flash
+GEMINI_MODELS = [
     m.strip() for m in os.environ.get(
-        "LLM_MODELS", "openai/gpt-oss-120b,openai/gpt-oss-20b"
+        "GEMINI_MODELS", "gemini-3.5-flash-lite"
     ).split(",") if m.strip()
 ]
 
-# "low" is fastest. You can use "medium" or "high" for harder questions.
-REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "low")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Speech-to-text model
-GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3")
-
-# Recordings smaller than this are treated as "too short" (about half a second)
-MIN_AUDIO_BYTES = 16000
+SAMPLE_RATE = 24000          # speech sent to the ESP32
+MIC_RATE = 16000             # microphone audio received from the ESP32
+FRAME_BYTES = 4096
+FIRST_CHUNK_CHARS = 40
+LONG_CHUNK_CHARS = 120
+MIN_AUDIO_BYTES = 12800      # about 0.4 s
+MAX_AUDIO_BYTES = 2_000_000  # about 60 s
+MAX_PHOTO_BYTES = 600_000
 
 SYSTEM_PROMPT = (
-    "You are a voice assistant speaking through a small speaker. "
-    "Answer in 2 to 4 short sentences. "
-    "Reply in the same language the user asked in. "
+    "You are a fast voice assistant speaking through a small speaker, and you have a camera. "
+    "You receive the user's question either as audio or as typed text. "
+    "Understand it in ANY language. "
+    "A photo from the device camera, taken at the moment of the question, may be attached. "
+    "Use the photo ONLY when the question is about what the camera can see, for example "
+    "'what is this', 'what do you see', 'read this', 'describe', 'what color', 'how many', "
+    "'is this ripe'. Otherwise ignore the photo completely and never mention it. "
+    "Reply in the same language the user spoke or wrote. "
+    "Start your reply with the language code in square brackets, then a space, then the answer. "
+    "Examples: [en] Hello! [bn] ... [hi] ... [ar] ... [ur] ... [es] ... "
+    "Start with the answer immediately. Use 1 to 3 short sentences unless asked for more. "
     "Use plain text only: no markdown, no bullet points, no emojis, no asterisks. "
     "Write math operators as words in the user's language, never as symbols like * or +. "
-    "You have a web_search tool. Use it for news, current events, anything recent or "
-    "'latest', prices, scores, weather, and general-knowledge or factual lookups "
-    "(who, what, when, where questions about real people, places, organizations or events). "
-    "Do NOT use it for greetings, small talk, jokes, opinions, advice, math, translation, "
-    "writing, or explaining how things work. Just answer those directly. "
-    "When web search results are provided, treat them as more up to date than your own "
-    "knowledge and base your answer on them. If the results do not contain the answer, "
-    "say you could not find it instead of guessing."
+    "If the audio has no understandable speech, reply exactly: [en] NO_SPEECH"
 )
 
-SEARCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "web_search",
-        "description": "Search the web for current news, recent events, or factual information.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "A short, specific web search query.",
-                }
-            },
-            "required": ["query"],
-        },
-    },
-}
+GEN_CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM_PROMPT,
+    max_output_tokens=600,
+)
 
 BUSY_MESSAGE = "Sorry, I am busy right now. Please try again in a moment."
-TOO_SHORT_MESSAGE = "The recording was too short. Please hold the button and try again."
+QUOTA_MESSAGE = "Sorry, my daily limit has been reached. Please try again later."
 NOT_HEARD_MESSAGE = "Sorry, I could not hear you clearly. Please try again."
 
-def get_voice_by_langdetect(text: str) -> str:
-    """Detects language using langdetect and assigns the neural voice"""
-    try:
-        lang = detect(text)
-        print(f"langdetect identified language code: {lang}")
+# ---------------------------------------------------------------
+# Voices (any language)
+# ---------------------------------------------------------------
+PREFERRED_VOICES = {
+    "en": "en-US-EmmaNeural", "bn": "bn-BD-NabanitaNeural", "hi": "hi-IN-SwaraNeural",
+    "ar": "ar-AE-FatimaNeural", "ur": "ur-PK-UzmaNeural", "es": "es-ES-ElviraNeural",
+    "fr": "fr-FR-DeniseNeural", "de": "de-DE-KatjaNeural", "ta": "ta-IN-PallaviNeural",
+    "te": "te-IN-ShrutiNeural", "ml": "ml-IN-SobhanaNeural", "kn": "kn-IN-SapnaNeural",
+    "mr": "mr-IN-AarohiNeural", "gu": "gu-IN-DhwaniNeural", "ne": "ne-NP-HemkalaNeural",
+    "si": "si-LK-ThiliniNeural", "id": "id-ID-GadisNeural", "ms": "ms-MY-YasminNeural",
+    "th": "th-TH-PremwadeeNeural", "vi": "vi-VN-HoaiMyNeural", "tr": "tr-TR-EmelNeural",
+    "ru": "ru-RU-SvetlanaNeural", "ja": "ja-JP-NanamiNeural", "ko": "ko-KR-SunHiNeural",
+    "zh": "zh-CN-XiaoxiaoNeural", "it": "it-IT-ElsaNeural", "pt": "pt-BR-FranciscaNeural",
+    "fa": "fa-IR-DilaraNeural", "he": "he-IL-HilaNeural",
+}
+VOICE_MAP = dict(PREFERRED_VOICES)
+LANG_ALIASES = {"iw": "he", "no": "nb", "tl": "fil", "jw": "jv"}
 
-        if lang == 'bn':
-            return "bn-BD-NabanitaNeural"
-        elif lang == 'hi':
-            return "hi-IN-SwaraNeural"
-        elif lang == 'ar':
-            return "ar-AE-FatimaNeural"
+async def load_voices():
+    """Build the language -> voice table from Edge's real voice list (validates the names)"""
+    voices = await edge_tts.list_voices()
+    names = {v["ShortName"] for v in voices}
+    by_lang = {}
+    for v in voices:
+        lang = v["Locale"].split("-")[0].lower()
+        by_lang.setdefault(lang, []).append(v)
+    for lang, items in by_lang.items():
+        preferred = PREFERRED_VOICES.get(lang)
+        if preferred in names:
+            VOICE_MAP[lang] = preferred
+        else:
+            female = [v for v in items if v.get("Gender") == "Female"] or items
+            VOICE_MAP[lang] = female[0]["ShortName"]
+    print(f"Voice table ready: {len(VOICE_MAP)} languages")
 
-    except Exception as e:
-        print(f"Language detection fallback to English: {e}")
+def script_lang(text: str) -> str:
+    """Fallback when the model forgets the language tag: guess from the writing script"""
+    bn = hi = ar = 0
+    for ch in text:
+        o = ord(ch)
+        if 0x0980 <= o <= 0x09FF:
+            bn += 1
+        elif 0x0900 <= o <= 0x097F:
+            hi += 1
+        elif 0x0600 <= o <= 0x06FF:
+            ar += 1
+    best = max(bn, hi, ar)
+    if best >= 2:
+        return "bn" if best == bn else ("hi" if best == hi else "ar")
+    return "en"
 
-    return "en-US-EmmaNeural"
+def voice_for(lang, text: str) -> str:
+    code = (lang or "").strip().lower() or script_lang(text)
+    primary = code.split("-")[0]
+    primary = LANG_ALIASES.get(primary, primary)
+    return VOICE_MAP.get(primary) or VOICE_MAP.get("en", "en-US-EmmaNeural")
 
+# ---------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------
 def clean_for_speech(text: str) -> str:
-    """Remove markdown symbols that would be read aloud or break TTS.
-    Asterisks between digits (like 55*453) are kept so math is not damaged."""
+    """Remove markdown symbols. Asterisks between digits (55*453) are kept."""
     text = re.sub(r"(?<!\d)\*+|\*+(?!\d)", "", text)
     text = re.sub(r"[_#`>~]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-async def generate_true_wav_bytes(text: str, voice_model: str) -> bytes:
-    """Generates speech in memory and converts it into 24kHz mono 16-bit PCM WAV"""
-    communicate = edge_tts.Communicate(text, voice_model)
+SENT_RE = re.compile(r'.*?[.!?।؟…]+["\')\]]*(?=\s)|.*?[。！？]+|.*?\n', re.S)
+TAG_RE = re.compile(r"^\s*\[([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)\]\s*")
 
-    mp3_buffer = io.BytesIO()
+def pop_chunk(buf: str, first: bool):
+    """Return (chunk, rest). chunk is '' if nothing is ready to speak yet."""
+    m = SENT_RE.match(buf)
+    if m and m.end() > 0:
+        return buf[:m.end()], buf[m.end():]
+
+    limit = FIRST_CHUNK_CHARS if first else LONG_CHUNK_CHARS
+    if len(buf) >= limit:
+        cut = max(buf.rfind(","), buf.rfind("،"))
+        if cut < 15:
+            cut = buf.rfind(" ")
+        else:
+            cut += 1
+        if cut > 10:
+            return buf[:cut], buf[cut:]
+    return "", buf
+
+def pcm_to_wav(pcm: bytes, rate: int = MIC_RATE) -> bytes:
+    header = (
+        b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " +
+        struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) +
+        b"data" + struct.pack("<I", len(pcm))
+    )
+    return header + pcm
+
+# ---------------------------------------------------------------
+# Speech
+# ---------------------------------------------------------------
+def mp3_to_pcm(mp3: bytes) -> bytes:
+    """MP3 -> raw 24 kHz mono 16-bit PCM"""
+    if miniaudio is not None:
+        decoded = miniaudio.decode(
+            mp3,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=SAMPLE_RATE,
+        )
+        return decoded.samples.tobytes()
+
+    sound = AudioSegment.from_mp3(io.BytesIO(mp3))
+    sound = sound.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
+    return sound.raw_data
+
+async def synth_pcm(text: str, voice: str) -> bytes:
+    communicate = edge_tts.Communicate(text, voice)
+    mp3 = bytearray()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
-            mp3_buffer.write(chunk["data"])
+            mp3.extend(chunk["data"])
+    if not mp3:
+        return b""
+    return await asyncio.to_thread(mp3_to_pcm, bytes(mp3))
 
-    mp3_buffer.seek(0)
+# ---------------------------------------------------------------
+# Gemini (audio + photo + text, streamed)
+# ---------------------------------------------------------------
+def build_contents(question: str, wav, jpeg):
+    contents = []
+    if jpeg:
+        contents.append("Camera photo taken at the moment of the question:")
+        contents.append(types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"))
+    if wav:
+        contents.append("The user's spoken question (audio):")
+        contents.append(types.Part.from_bytes(data=wav, mime_type="audio/wav"))
+    else:
+        contents.append(f"The user's typed question: {question}")
+    return contents
 
-    sound = AudioSegment.from_mp3(mp3_buffer)
-    sound = sound.set_frame_rate(24000)
-    sound = sound.set_channels(1)
-    sound = sound.set_sample_width(2)
-
-    wav_buffer = io.BytesIO()
-    sound.export(wav_buffer, format="wav")
-    return wav_buffer.getvalue()
-
-def wav_response(wav_bytes: bytes) -> Response:
-    return Response(
-        content=wav_bytes,
-        media_type="audio/wav",
-        headers={
-            "Content-Disposition": "attachment; filename=response.wav",
-            "Content-Length": str(len(wav_bytes))
-        }
-    )
-
-async def speak_message(text: str) -> Response:
-    """Speak a fixed English message (errors, hints) so the speaker is never silent"""
-    try:
-        return wav_response(await generate_true_wav_bytes(text, "en-US-EmmaNeural"))
-    except Exception as e:
-        print(f"Could not generate message audio: {e}")
-        raise HTTPException(status_code=500, detail=text)
-
-async def tavily_search(query: str) -> str:
-    """Search the web with Tavily and return a compact text summary.
-    Returns an empty string if search is unavailable, so the model still answers."""
-    if not TAVILY_API_KEY:
-        print("TAVILY_API_KEY not set, skipping web search")
-        return ""
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(
-                "https://api.tavily.com/search",
-                headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
-                json={
-                    "query": query,
-                    "search_depth": "basic",
-                    "max_results": 3,
-                    "include_answer": True,
-                    "include_images": True,
-                    "include_image_descriptions": True,
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-    except Exception as e:
-        print(f"Tavily search failed, continuing without it: {e}")
-        return ""
-
-    parts = []
-    if data.get("answer"):
-        parts.append(f"Summary: {data['answer']}")
-    for item in data.get("results", []):
-        title = item.get("title", "")
-        content = (item.get("content") or "")[:500]
-        parts.append(f"- {title}: {content}")
-    for img in data.get("images", [])[:3]:
-        if isinstance(img, dict) and img.get("description"):
-            parts.append(f"- Image: {img['description']}")
-    return "\n".join(parts)
-
-async def transcribe_with_groq(wav_bytes: bytes, language: str = "") -> str:
-    """Send the recorded WAV to Groq Whisper and return the transcript text.
-    Leave language empty for auto-detect, or pass a code like 'bn', 'hi', 'en'."""
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not set on the server")
-
-    form = {
-        "model": GROQ_STT_MODEL,
-        "response_format": "json",
-        "temperature": "0",
-    }
-    if language:
-        form["language"] = language
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(
-            GROQ_STT_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": ("question.wav", wav_bytes, "audio/wav")},
-            data=form,
-        )
-        r.raise_for_status()
-        return (r.json().get("text") or "").strip()
-
-async def groq_chat(messages: list, tools: list = None) -> dict:
-    """Call Groq chat completions. Tries each model in LLM_MODELS in order.
-    Retries once on server errors, and moves to the next model on rate limits or other errors.
-    Returns the assistant message dict."""
-    if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not set on the server")
+async def stream_gemini(contents):
+    """Yields text pieces as Gemini writes them. Retries once on 503, then tries the next model."""
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is not set on the server")
 
     last_error = None
-    for model in LLM_MODELS:
+    for model in GEMINI_MODELS:
         for attempt in range(2):
-            payload = {
-                "model": model,
-                "messages": messages,
-                "reasoning_effort": REASONING_EFFORT,
-                "max_completion_tokens": 1500,
-            }
-            if tools:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
-
+            got_text = False
             try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.post(
-                        GROQ_CHAT_URL,
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                        json=payload,
-                    )
-            except httpx.HTTPError as e:
+                stream = await gemini_client.aio.models.generate_content_stream(
+                    model=model, contents=contents, config=GEN_CONFIG
+                )
+                async for chunk in stream:
+                    text = chunk.text
+                    if text:
+                        got_text = True
+                        yield text
+                if got_text:
+                    return
+                last_error = RuntimeError("Gemini returned an empty answer")
+                break
+            except Exception as e:
                 last_error = e
-                print(f"[{model}] attempt {attempt + 1} network error: {e}")
-                await asyncio.sleep(1)
-                continue
-
-            if r.status_code == 200:
-                return r.json()["choices"][0]["message"]
-
-            last_error = RuntimeError(f"Groq {r.status_code}: {r.text[:300]}")
-            print(f"[{model}] attempt {attempt + 1} failed: {r.status_code} {r.text[:200]}")
-
-            # The model tried to call the tool but formatted it badly.
-            # Treat it as "a search is needed" so the question is still answered.
-            if r.status_code == 400 and tools and "tool_use_failed" in r.text:
-                return {"_tool_failed": True}
-
-            if r.status_code >= 500:
-                await asyncio.sleep(1)
-                continue          # retry the same model once
-            break                 # rate limit or other error: go to next model
-
+                msg = str(e)
+                print(f"[{model}] attempt {attempt + 1} failed: {msg[:200]}")
+                if got_text:
+                    return
+                if "503" in msg or "UNAVAILABLE" in msg:
+                    await asyncio.sleep(1)
+                    continue          # retry the same model once
+                break                 # quota or other error: next model
     raise last_error
 
-async def ask_llm(question: str) -> str:
-    today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
+# ---------------------------------------------------------------
+# One turn: Gemini stream -> sentences -> speech -> ESP32
+# ---------------------------------------------------------------
+async def send_pcm(ws: WebSocket, pcm: bytes):
+    for i in range(0, len(pcm), FRAME_BYTES):
+        await ws.send_bytes(pcm[i:i + FRAME_BYTES])
 
-    # Step 1: the model decides. It either answers directly or asks for a web search.
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Today's date: {today}\n\nQuestion: {question}"},
-    ]
-    first = await groq_chat(messages, tools=[SEARCH_TOOL])
+async def run_turn(ws: WebSocket, tid: str, question: str, wav, jpeg):
+    t0 = time.perf_counter()
 
-    query = None
-    if first.get("_tool_failed"):
-        query = question
-    elif first.get("tool_calls"):
+    def ms() -> int:
+        return int((time.perf_counter() - t0) * 1000)
+
+    kind = "voice" if wav else "text"
+    print(f"[0 ms] Turn {tid}: {kind}, photo={'yes' if jpeg else 'no'}, "
+          f"audio={len(wav) if wav else 0} B, photo={len(jpeg) if jpeg else 0} B {question[:60]}")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    tasks = []
+    state = {"voice": None, "lang": None, "error": None, "no_speech": False}
+
+    def submit(raw: str) -> bool:
+        text = clean_for_speech(raw)
+        if text.upper().startswith("NO_SPEECH"):
+            state["no_speech"] = True
+            return False
+        if not any(c.isalnum() for c in text):
+            return False
+        if state["voice"] is None:
+            state["voice"] = voice_for(state["lang"], text)
+            print(f"[{ms()} ms] language={state['lang']} voice={state['voice']}")
+        task = asyncio.create_task(synth_pcm(text, state["voice"]))
+        tasks.append(task)
+        queue.put_nowait(task)
+        print(f"[{ms()} ms] speech chunk: {text[:60]}")
+        return True
+
+    async def producer():
+        buf = ""
+        first = True
+        resolved = False
+        first_token = False
         try:
-            args = json.loads(first["tool_calls"][0]["function"]["arguments"] or "{}")
-            query = args.get("query") or question
+            async for piece in stream_gemini(build_contents(question, wav, jpeg)):
+                if not first_token:
+                    print(f"[{ms()} ms] first Gemini text")
+                    first_token = True
+                buf += piece
+
+                # Read the language tag at the start, e.g. "[bn] ..."
+                if not resolved:
+                    stripped = buf.lstrip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith("["):
+                        if "]" not in stripped and len(stripped) < 12:
+                            continue                  # wait for the rest of the tag
+                        m = TAG_RE.match(buf)
+                        if m:
+                            state["lang"] = m.group(1)
+                            buf = buf[m.end():]
+                    resolved = True
+
+                while True:
+                    chunk, buf = pop_chunk(buf, first)
+                    if not chunk:
+                        break
+                    if submit(chunk):
+                        first = False
+
+            if not resolved:
+                m = TAG_RE.match(buf)
+                if m:
+                    state["lang"] = m.group(1)
+                    buf = buf[m.end():]
+            if buf.strip():
+                submit(buf)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[{ms()} ms] Gemini error: {e}")
+            state["error"] = str(e)
+        finally:
+            queue.put_nowait(None)
+
+    prod = asyncio.create_task(producer())
+    started = False
+    try:
+        while True:
+            task = await queue.get()
+            if task is None:
+                break
+            try:
+                pcm = await task
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[{ms()} ms] speech error: {e}")
+                continue
+            if not pcm:
+                continue
+            if not started:
+                await ws.send_text(f"start:{tid}")
+                started = True
+                print(f"[{ms()} ms] first audio sent")
+            await send_pcm(ws, pcm)
+
+        await prod
+
+        if not started:
+            if state["no_speech"]:
+                message = NOT_HEARD_MESSAGE
+            elif state["error"] and ("429" in state["error"] or "RESOURCE_EXHAUSTED" in state["error"]):
+                message = QUOTA_MESSAGE
+            else:
+                message = BUSY_MESSAGE
+            pcm = await synth_pcm(message, VOICE_MAP.get("en", "en-US-EmmaNeural"))
+            await ws.send_text(f"start:{tid}")
+            await send_pcm(ws, pcm)
+
+        await ws.send_text(f"end:{tid}")
+        print(f"[{ms()} ms] done")
+
+    except asyncio.CancelledError:
+        print(f"[{ms()} ms] cancelled")
+        raise
+    except Exception as e:
+        print(f"[{ms()} ms] error: {e}")
+        try:
+            await ws.send_text(f"error:{tid}")
         except Exception:
-            query = question
+            pass
+    finally:
+        prod.cancel()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
 
-    if query is None:
-        print("No web search needed, answering directly")
-        return (first.get("content") or "").strip() or "Sorry, I could not think of an answer."
-
-    # Step 2: a search was requested, so run Tavily and answer from the results.
-    print(f"Searching Tavily for: {query}")
-    search_context = await tavily_search(query)
-    print(f"Search context:\n{search_context or '(none)'}")
-
-    prompt = f"Today's date: {today}\n\n"
-    if search_context:
-        prompt += f"Web search results:\n{search_context}\n\n"
-    prompt += f"Question: {question}"
-
-    second = await groq_chat([
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ])
-    return (second.get("content") or "").strip() or "Sorry, I could not think of an answer."
-
-async def answer_to_wav(question: str) -> bytes:
-    """Shared by /ask (typed) and /voice (spoken): question -> model -> speech WAV"""
-    answer = clean_for_speech(await ask_llm(question))
-    print(f"Question: {question}\nAnswer: {answer}")
-    voice = get_voice_by_langdetect(answer)
-    return await generate_true_wav_bytes(answer, voice)
+# ---------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------
+@app.on_event("startup")
+async def warm_up():
+    async def _warm():
+        try:
+            await load_voices()
+        except Exception as e:
+            print(f"Voice list not loaded, using built-in table: {e}")
+        try:
+            await synth_pcm("hi", VOICE_MAP.get("en", "en-US-EmmaNeural"))
+            print("Warm-up done")
+        except Exception as e:
+            print(f"Warm-up skipped: {e}")
+    asyncio.create_task(_warm())
 
 @app.api_route("/ping", methods=["GET", "HEAD"])
 def ping():
     return {"status": "alive"}
 
-# Speaks exactly the text you send
-@app.get("/tts")
-async def text_to_speech_wav(text: str):
-    if not text:
-        raise HTTPException(status_code=400, detail="Text parameter cannot be empty")
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    if DEVICE_KEY and ws.query_params.get("key") != DEVICE_KEY:
+        await ws.close(code=1008)
+        return
+
+    await ws.accept()
+    print("ESP32 connected")
+    await ws.send_text("ready")
+
+    tid = "0"
+    photo = bytearray()
+    audio = bytearray()
+    current = None
 
     try:
-        selected_voice = get_voice_by_langdetect(text)
-        wav_bytes = await generate_true_wav_bytes(text, selected_voice)
-        return wav_response(wav_bytes)
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+
+            data = message.get("bytes")
+            text = message.get("text")
+
+            # Binary: first byte says what it is. 1 = microphone audio, 2 = camera photo
+            if data is not None:
+                if len(data) < 2:
+                    continue
+                kind, body = data[0], data[1:]
+                if kind == 2 and len(photo) < MAX_PHOTO_BYTES:
+                    photo.extend(body)
+                elif kind == 1 and len(audio) < MAX_AUDIO_BYTES:
+                    audio.extend(body)
+                continue
+
+            if text is None:
+                continue
+
+            if text.startswith("BEGIN:"):
+                if current and not current.done():
+                    current.cancel()
+                tid = text[6:].strip() or "0"
+                photo = bytearray()
+                audio = bytearray()
+
+            elif text.startswith("CANCEL"):
+                if current and not current.done():
+                    current.cancel()
+                photo = bytearray()
+                audio = bytearray()
+
+            elif text.startswith("TEXT:"):
+                question = text[5:].strip()
+                if question:
+                    jpeg = bytes(photo) if photo else None
+                    current = asyncio.create_task(run_turn(ws, tid, question, None, jpeg))
+                photo = bytearray()
+                audio = bytearray()
+
+            elif text == "AUDIO_END":
+                pcm = bytes(audio)
+                jpeg = bytes(photo) if photo else None
+                photo = bytearray()
+                audio = bytearray()
+                if len(pcm) < MIN_AUDIO_BYTES:
+                    await ws.send_text(f"end:{tid}")
+                else:
+                    current = asyncio.create_task(
+                        run_turn(ws, tid, "", pcm_to_wav(pcm), jpeg))
 
     except Exception as e:
-        print(f"Server Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Typed question (Serial Monitor): the model decides whether to search, then speaks
-@app.get("/ask")
-async def ask_and_speak(q: str):
-    if not q:
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-
-    try:
-        return wav_response(await answer_to_wav(q))
-    except Exception as e:
-        print(f"Server Error: {e}")
-        return await speak_message(BUSY_MESSAGE)
-
-# Spoken question (microphone): the ESP32 POSTs the recorded WAV as the raw body.
-# Optional: /voice?lang=bn to force a language (default is auto-detect).
-@app.post("/voice")
-async def voice_question(request: Request, lang: str = ""):
-    body = await request.body()
-    print(f"Received audio: {len(body)} bytes")
-
-    if len(body) < MIN_AUDIO_BYTES or body[:4] != b"RIFF":
-        print("Audio too short or not a WAV file")
-        return await speak_message(TOO_SHORT_MESSAGE)
-
-    try:
-        question = await transcribe_with_groq(body, lang)
-        print(f"Transcript: {question}")
-
-        if not question:
-            return await speak_message(NOT_HEARD_MESSAGE)
-
-        return wav_response(await answer_to_wav(question))
-
-    except Exception as e:
-        print(f"Server Error: {e}")
-        return await speak_message(BUSY_MESSAGE)
+        print(f"WebSocket closed: {e}")
+    finally:
+        print("ESP32 disconnected")
+        if current and not current.done():
+            current.cancel()
