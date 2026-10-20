@@ -44,7 +44,9 @@ MIC_RATE = 16000             # microphone audio received from the ESP32
 FRAME_BYTES = 4096
 FIRST_CHUNK_CHARS = 40
 LONG_CHUNK_CHARS = 120
-MIN_AUDIO_BYTES = 12800      # about 0.4 s
+MIN_CHUNK_CHARS = 25         # shorter sentences are joined with the next one
+MIN_PCM_BYTES = 2400         # speech shorter than 50 ms counts as a failure
+MIN_AUDIO_BYTES = 12800      # about 0.4 s of microphone audio
 MAX_AUDIO_BYTES = 2_000_000  # about 60 s
 MAX_PHOTO_BYTES = 600_000
 
@@ -145,10 +147,24 @@ SENT_RE = re.compile(r'.*?[.!?।؟…]+["\')\]]*(?=\s)|.*?[。！？]+|.*?\n', 
 TAG_RE = re.compile(r"^\s*\[([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)\]\s*")
 
 def pop_chunk(buf: str, first: bool):
-    """Return (chunk, rest). chunk is '' if nothing is ready to speak yet."""
+    """Return (chunk, rest). chunk is '' if nothing is ready to speak yet.
+    Very short sentences ("Hello!") are joined with the next one, because tiny
+    speech requests fail more often."""
     m = SENT_RE.match(buf)
     if m and m.end() > 0:
-        return buf[:m.end()], buf[m.end():]
+        chunk, rest = buf[:m.end()], buf[m.end():]
+        ok = True
+        while len(chunk.strip()) < MIN_CHUNK_CHARS:
+            stripped = rest.lstrip()
+            m2 = SENT_RE.match(stripped)
+            if not m2 or m2.end() == 0:
+                ok = False            # next sentence is not finished yet
+                break
+            lead = len(rest) - len(stripped)
+            chunk += rest[:lead + m2.end()]
+            rest = rest[lead + m2.end():]
+        if ok:
+            return chunk, rest
 
     limit = FIRST_CHUNK_CHARS if first else LONG_CHUNK_CHARS
     if len(buf) >= limit:
@@ -169,6 +185,13 @@ def pcm_to_wav(pcm: bytes, rate: int = MIC_RATE) -> bytes:
     )
     return header + pcm
 
+def peak_level(pcm: bytes) -> int:
+    """Loudest sample (0 = pure silence, about 30000 = very loud). -1 if it cannot be measured."""
+    try:
+        return sys.modules["audioop"].max(pcm, 2)
+    except Exception:
+        return -1
+
 # ---------------------------------------------------------------
 # Speech
 # ---------------------------------------------------------------
@@ -188,14 +211,30 @@ def mp3_to_pcm(mp3: bytes) -> bytes:
     return sound.raw_data
 
 async def synth_pcm(text: str, voice: str) -> bytes:
-    communicate = edge_tts.Communicate(text, voice)
-    mp3 = bytearray()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3.extend(chunk["data"])
-    if not mp3:
-        return b""
-    return await asyncio.to_thread(mp3_to_pcm, bytes(mp3))
+    """Text -> speech PCM. Retries when Edge TTS returns nothing, too little, or silence."""
+    last = None
+    for attempt in range(3):
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+            mp3 = bytearray()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    mp3.extend(chunk["data"])
+            if mp3:
+                pcm = await asyncio.to_thread(mp3_to_pcm, bytes(mp3))
+                peak = peak_level(pcm)
+                if len(pcm) >= MIN_PCM_BYTES and (peak < 0 or peak > 50):
+                    return pcm
+                last = RuntimeError(f"speech too short or silent ({len(pcm)} bytes, peak {peak})")
+            else:
+                last = RuntimeError("no audio received")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last = e
+        print(f"TTS attempt {attempt + 1} failed for '{text[:30]}': {last}")
+        await asyncio.sleep(0.3)
+    raise last
 
 # ---------------------------------------------------------------
 # Gemini (audio + photo + text, streamed)
@@ -260,8 +299,8 @@ async def run_turn(ws: WebSocket, tid: str, question: str, wav, jpeg):
         return int((time.perf_counter() - t0) * 1000)
 
     kind = "voice" if wav else "text"
-    print(f"[0 ms] Turn {tid}: {kind}, photo={'yes' if jpeg else 'no'}, "
-          f"audio={len(wav) if wav else 0} B, photo={len(jpeg) if jpeg else 0} B {question[:60]}")
+    print(f"[0 ms] Turn {tid}: {kind}, audio={len(wav) if wav else 0} B, "
+          f"photo={len(jpeg) if jpeg else 0} B {question[:60]}")
 
     queue: asyncio.Queue = asyncio.Queue()
     tasks = []
@@ -347,6 +386,8 @@ async def run_turn(ws: WebSocket, tid: str, question: str, wav, jpeg):
                 continue
             if not pcm:
                 continue
+            print(f"[{ms()} ms] speech ready: {len(pcm)} bytes, "
+                  f"{len(pcm) / (SAMPLE_RATE * 2):.1f} s, peak {peak_level(pcm)}")
             if not started:
                 await ws.send_text(f"start:{tid}")
                 started = True
@@ -395,7 +436,7 @@ async def warm_up():
         except Exception as e:
             print(f"Voice list not loaded, using built-in table: {e}")
         try:
-            await synth_pcm("hi", VOICE_MAP.get("en", "en-US-EmmaNeural"))
+            await synth_pcm("Hello there, I am ready.", VOICE_MAP.get("en", "en-US-EmmaNeural"))
             print("Warm-up done")
         except Exception as e:
             print(f"Warm-up skipped: {e}")
