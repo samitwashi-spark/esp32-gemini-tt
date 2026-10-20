@@ -1,7 +1,7 @@
 fastapi
-uvicorn[standard]
-edge-tts
+uvicorn
 google-genai
+edge-tts
 pydub
 langdetect
-audioop-lts; python_version >= "3.13"
+audioop-lts
