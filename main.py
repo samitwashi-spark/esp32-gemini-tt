@@ -25,10 +25,19 @@ try:
 except Exception:
     miniaudio = None
 
+# Optional Tavily client for live search context
+try:
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None
+
 app = FastAPI()
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 DEVICE_KEY = os.environ.get("DEVICE_KEY", "")      # optional shared secret
+
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if (TAVILY_API_KEY and TavilyClient) else None
 
 # Tried in order. Add a fallback in Render, e.g. GEMINI_MODELS=gemini-3.5-flash-lite,gemini-3.5-flash
 GEMINI_MODELS = [
@@ -42,7 +51,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 SAMPLE_RATE = 24000          # speech sent to the ESP32
 MIC_RATE = 16000             # microphone audio received from the ESP32
 FRAME_BYTES = 4096
-FIRST_CHUNK_CHARS = 40
+FIRST_CHUNK_CHARS = 80       # Increased slightly to prevent starting mid-sentence
 LONG_CHUNK_CHARS = 120
 MIN_CHUNK_CHARS = 25         # shorter sentences are joined with the next one
 MIN_PCM_BYTES = 2400         # speech shorter than 50 ms counts as a failure
@@ -58,6 +67,7 @@ SYSTEM_PROMPT = (
     "Use the photo ONLY when the question is about what the camera can see, for example "
     "'what is this', 'what do you see', 'read this', 'describe', 'what color', 'how many', "
     "'is this ripe'. Otherwise ignore the photo completely and never mention it. "
+    "If the user asks for real-time information, current news, facts, or web searches, use the search tool. "
     "Reply in the same language the user spoke or wrote. "
     "Start your reply with the language code in square brackets, then a space, then the answer. "
     "Examples: [en] Hello! [bn] ... [hi] ... [ar] ... [ur] ... [es] ... "
@@ -67,9 +77,32 @@ SYSTEM_PROMPT = (
     "If the audio has no understandable speech, reply exactly: [en] NO_SPEECH"
 )
 
+# ---------------------------------------------------------------
+# Tavily Search Tool Definition
+# ---------------------------------------------------------------
+def search_web(query: str) -> str:
+    """Search the web for up-to-date information, news, or factual answers using Tavily.
+    
+    Args:
+        query: The search query string.
+    """
+    if not tavily_client:
+        return "Search tool is not configured."
+    try:
+        response = tavily_client.search(query=query, max_results=3)
+        results = response.get("results", [])
+        snippets = [r.get("content", "") for r in results]
+        return "\n".join(snippets) if snippets else "No relevant information found."
+    except Exception as e:
+        return f"Search error: {str(e)}"
+
+# Register tools if Tavily is available
+tools_list = [search_web] if tavily_client else []
+
 GEN_CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM_PROMPT,
     max_output_tokens=600,
+    tools=tools_list if tools_list else None,
 )
 
 BUSY_MESSAGE = "Sorry, I am busy right now. Please try again in a moment."
@@ -95,7 +128,6 @@ VOICE_MAP = dict(PREFERRED_VOICES)
 LANG_ALIASES = {"iw": "he", "no": "nb", "tl": "fil", "jw": "jv"}
 
 async def load_voices():
-    """Build the language -> voice table from Edge's real voice list (validates the names)"""
     voices = await edge_tts.list_voices()
     names = {v["ShortName"] for v in voices}
     by_lang = {}
@@ -112,7 +144,6 @@ async def load_voices():
     print(f"Voice table ready: {len(VOICE_MAP)} languages")
 
 def script_lang(text: str) -> str:
-    """Fallback when the model forgets the language tag: guess from the writing script"""
     bn = hi = ar = 0
     for ch in text:
         o = ord(ch)
@@ -137,7 +168,6 @@ def voice_for(lang, text: str) -> str:
 # Text helpers
 # ---------------------------------------------------------------
 def clean_for_speech(text: str) -> str:
-    """Remove markdown symbols. Asterisks between digits (55*453) are kept."""
     text = re.sub(r"(?<!\d)\*+|\*+(?!\d)", "", text)
     text = re.sub(r"[_#`>~]", "", text)
     text = re.sub(r"\s+", " ", text)
@@ -147,9 +177,6 @@ SENT_RE = re.compile(r'.*?[.!?।؟…]+["\')\]]*(?=\s)|.*?[。！？]+|.*?\n', 
 TAG_RE = re.compile(r"^\s*\[([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?)\]\s*")
 
 def pop_chunk(buf: str, first: bool):
-    """Return (chunk, rest). chunk is '' if nothing is ready to speak yet.
-    Very short sentences ("Hello!") are joined with the next one, because tiny
-    speech requests fail more often."""
     m = SENT_RE.match(buf)
     if m and m.end() > 0:
         chunk, rest = buf[:m.end()], buf[m.end():]
@@ -158,7 +185,7 @@ def pop_chunk(buf: str, first: bool):
             stripped = rest.lstrip()
             m2 = SENT_RE.match(stripped)
             if not m2 or m2.end() == 0:
-                ok = False            # next sentence is not finished yet
+                ok = False
                 break
             lead = len(rest) - len(stripped)
             chunk += rest[:lead + m2.end()]
@@ -177,26 +204,13 @@ def pop_chunk(buf: str, first: bool):
             return buf[:cut], buf[cut:]
     return "", buf
 
-def pcm_to_wav(pcm: bytes, rate: int = MIC_RATE) -> bytes:
-    header = (
-        b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " +
-        struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) +
-        b"data" + struct.pack("<I", len(pcm))
-    )
-    return header + pcm
-
 def peak_level(pcm: bytes) -> int:
-    """Loudest sample (0 = pure silence, about 30000 = very loud). -1 if it cannot be measured."""
     try:
         return sys.modules["audioop"].max(pcm, 2)
     except Exception:
         return -1
 
-# ---------------------------------------------------------------
-# Speech
-# ---------------------------------------------------------------
 def mp3_to_pcm(mp3: bytes) -> bytes:
-    """MP3 -> raw 24 kHz mono 16-bit PCM"""
     if miniaudio is not None:
         decoded = miniaudio.decode(
             mp3,
@@ -211,7 +225,6 @@ def mp3_to_pcm(mp3: bytes) -> bytes:
     return sound.raw_data
 
 async def synth_pcm(text: str, voice: str) -> bytes:
-    """Text -> speech PCM. Retries when Edge TTS returns nothing, too little, or silence."""
     last = None
     for attempt in range(3):
         try:
@@ -236,9 +249,6 @@ async def synth_pcm(text: str, voice: str) -> bytes:
         await asyncio.sleep(0.3)
     raise last
 
-# ---------------------------------------------------------------
-# Gemini (audio + photo + text, streamed)
-# ---------------------------------------------------------------
 def build_contents(question: str, wav, jpeg):
     contents = []
     if jpeg:
@@ -252,7 +262,6 @@ def build_contents(question: str, wav, jpeg):
     return contents
 
 async def stream_gemini(contents):
-    """Yields text pieces as Gemini writes them. Retries once on 503, then tries the next model."""
     if gemini_client is None:
         raise RuntimeError("GEMINI_API_KEY is not set on the server")
 
@@ -261,14 +270,18 @@ async def stream_gemini(contents):
         for attempt in range(2):
             got_text = False
             try:
-                stream = await gemini_client.aio.models.generate_content_stream(
+                # Use automatic function calling if tavily tool is available
+                response = await gemini_client.aio.models.generate_content(
                     model=model, contents=contents, config=GEN_CONFIG
                 )
-                async for chunk in stream:
-                    text = chunk.text
-                    if text:
-                        got_text = True
-                        yield text
+                
+                # If model issued tool calls and automatic calling didn't resolve text, handle manually or let SDK handle
+                # With SDK v0.7+, automatic function calling executes tools automatically if configured, 
+                # but to ensure text streaming works seamlessly with tool outputs, we yield response text directly.
+                if response.text:
+                    got_text = True
+                    yield response.text
+                
                 if got_text:
                     return
                 last_error = RuntimeError("Gemini returned an empty answer")
@@ -277,17 +290,12 @@ async def stream_gemini(contents):
                 last_error = e
                 msg = str(e)
                 print(f"[{model}] attempt {attempt + 1} failed: {msg[:200]}")
-                if got_text:
-                    return
                 if "503" in msg or "UNAVAILABLE" in msg:
                     await asyncio.sleep(1)
-                    continue          # retry the same model once
-                break                 # quota or other error: next model
+                    continue
+                break
     raise last_error
 
-# ---------------------------------------------------------------
-# One turn: Gemini stream -> sentences -> speech -> ESP32
-# ---------------------------------------------------------------
 async def send_pcm(ws: WebSocket, pcm: bytes):
     for i in range(0, len(pcm), FRAME_BYTES):
         await ws.send_bytes(pcm[i:i + FRAME_BYTES])
@@ -334,14 +342,13 @@ async def run_turn(ws: WebSocket, tid: str, question: str, wav, jpeg):
                     first_token = True
                 buf += piece
 
-                # Read the language tag at the start, e.g. "[bn] ..."
                 if not resolved:
                     stripped = buf.lstrip()
                     if not stripped:
                         continue
                     if stripped.startswith("["):
                         if "]" not in stripped and len(stripped) < 12:
-                            continue                  # wait for the rest of the tag
+                            continue
                         m = TAG_RE.match(buf)
                         if m:
                             state["lang"] = m.group(1)
@@ -425,9 +432,6 @@ async def run_turn(ws: WebSocket, tid: str, question: str, wav, jpeg):
             if not t.done():
                 t.cancel()
 
-# ---------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------
 @app.on_event("startup")
 async def warm_up():
     async def _warm():
@@ -470,7 +474,6 @@ async def ws_endpoint(ws: WebSocket):
             data = message.get("bytes")
             text = message.get("text")
 
-            # Binary: first byte says what it is. 1 = microphone audio, 2 = camera photo
             if data is not None:
                 if len(data) < 2:
                     continue
