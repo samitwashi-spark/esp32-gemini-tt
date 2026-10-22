@@ -1,8 +1,4 @@
-Fastapi
-uvicorn[standard]
-edge-tts
-google-genai
-pydub
-audioop-lts; python_version >= "3.13"
-miniaudio
-httpx
+fastapi
+uvicorn
+pillow
+numpy
