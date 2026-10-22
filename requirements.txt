@@ -1,10 +1,7 @@
-fastapi
+Fastapi
 uvicorn[standard]
 edge-tts
 google-genai
 pydub
 audioop-lts; python_version >= "3.13"
-
-# Optional, faster speech decoding. Uncomment ONLY after everything else works,
-# because if it fails to build, the whole deploy fails.
-# miniaudio
+miniaudio
