@@ -1,4 +1,7 @@
 fastapi
-uvicorn
-pillow
-numpy
+uvicorn[standard]
+edge-tts
+miniaudio
+langdetect
+pydub
+audioop-lts; python_version >= "3.13"
